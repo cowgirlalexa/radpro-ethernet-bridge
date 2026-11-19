@@ -1,3 +1,4 @@
+#include "NetworkStatus.h"
 #include "Safecast/SafecastPublisher.h"
 
 #include <ArduinoJson.h>
@@ -147,7 +148,7 @@ bool SafecastPublisher::publishPending()
         return true;
     }
 
-    if (WiFi.status() != WL_CONNECTED)
+    if (!NetworkStatus::connected())
     {
         syncHealthState();
         return true;
@@ -208,7 +209,7 @@ bool SafecastPublisher::publishPending()
 SafecastPublisher::UploadResult SafecastPublisher::sendTestUpload(const AppConfig &configOverride)
 {
     UploadResult result;
-    if (WiFi.status() != WL_CONNECTED)
+    if (!NetworkStatus::connected())
     {
         result.errorMessage = "Wi-Fi is not connected.";
         return result;

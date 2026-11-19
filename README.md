@@ -1,5 +1,7 @@
 # RadPro WiFi Bridge (ESP32-S3)
 
+Ethernet fork development release: **v0.6.01 — UI refresh fix**. This fork is based on upstream RadPro WiFi Bridge 1.15.13.
+
 ![RadPro WiFi Bridge](docs/pictures/radpro_wifi_bridge_connected_to_fs-600.jpg)
 
 Wi-Fi/USB bridge firmware for **Rad Pro class** Geiger counters, built on the excellent open-source Rad Pro firmware from https://github.com/Gissio/radpro.  
@@ -60,7 +62,7 @@ See [docs/board-requirements.md](docs/board-requirements.md) if you want to comp
 
 ## Web Installer (ESP Web Tools)
 
-Flash the bridge firmware straight from your browser: https://SunboX.github.io/radpro-wifi-bridge/web-install/ (v1.15.13)
+The upstream browser installer at https://SunboX.github.io/radpro-wifi-bridge/web-install/ is for the upstream project and does **not** include this Ethernet fork. Build and upload this fork with PlatformIO as described below.
 
 Connect the ESP32-S3 via USB, click **Install**, and follow the prompts—no local toolchain required. OTA updates of the bridge firmware are also available from the web portal once a network connection is active.
 
@@ -69,7 +71,7 @@ Connect the ESP32-S3 via USB, click **Install**, and follow the prompts—no loc
 ## PlatformIO Install
 
 1. Install [PlatformIO](https://platformio.org/) and open this project.
-2. The default environment targets the project-local **ESP32-S3 DevKitC-1 (N16R8)** profile with TinyUSB host support (`platformio.ini`) and a custom `partitions.csv` that provides two OTA slots plus a `2 MB` LittleFS partition on `16 MB` flash.
+2. This Ethernet-first build targets the project-local **Waveshare ESP32-S3-ETH** profile (ESP32-S3R8, 16 MB flash, 8 MB OPI PSRAM) with TinyUSB host support (`platformio.ini`) and a custom `partitions.csv` that provides two OTA slots plus a `2 MB` LittleFS partition on `16 MB` flash.
 3. Connect the board with **two** USB cables:
     - CP210x (UART) port → logs & commands (`Serial0`, 115200 baud).
     - Native USB-OTG port → leave free for the RadPro sensor.
@@ -80,7 +82,7 @@ Connect the ESP32-S3 via USB, click **Install**, and follow the prompts—no loc
 ## First Boot & Portal
 
 1. Watch the countdown on the UART. Enter `start` to skip the delay or adjust it with `delay <ms>`.
-2. On first boot— or whenever stored credentials fail— the firmware hosts a captive portal named `<device name> Setup`. After Wi-Fi joins successfully the same configuration UI is served at `http://<device-ip>/`.
+2. On boot, the firmware tries the onboard W5500 Ethernet interface first. If Ethernet receives a DHCP address, Wi-Fi is not initialized and the configuration UI is served at `http://<ethernet-ip>/`. If Ethernet is unavailable, the original behavior is retained: saved Wi-Fi credentials are tried, or a captive portal named `<device name> Setup` is started.
 
 ---
 
@@ -281,3 +283,10 @@ Original source: https://github.com/SunboX/radpro-wifi-bridge
 Copyright, license, attribution, and source-origin notices must be preserved as required by the GPL and the notice files in this repository.
 
 Bundled third-party components keep their own licenses. See the license files and SPDX metadata within `components/` and `data/portal/js/jszip.min.js` for those terms.
+
+
+## Waveshare ESP32-S3-ETH
+
+This fork includes support for the Waveshare ESP32-S3-ETH W5500 Ethernet board. Ethernet is preferred and Wi-Fi is kept off whenever Ethernet has an IP address. If Ethernet is unavailable, the existing Wi-FiManager setup/fallback remains available.
+
+See `docs/waveshare-esp32-s3-eth.md` for the network behavior and pin mapping.

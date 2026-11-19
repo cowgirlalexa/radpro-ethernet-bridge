@@ -11,6 +11,7 @@ Import("env")
 
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from fs_partition import resolve_fs_partition
@@ -106,7 +107,24 @@ def upload_filesystem(source, target, env):
     print(
         f"[auto_uploadfs] Uploading LittleFS image to 0x{fs_partition['offset']:06x} via {upload_port}…"
     )
-    subprocess.check_call(cmd)
+
+    # The normal firmware upload ends with a hard reset. On macOS the ESP32-S3
+    # USB CDC port can remain busy briefly while it re-enumerates, so give it
+    # a moment and retry the exact same esptool command if needed.
+    time.sleep(2.0)
+    attempts = 5
+    for attempt in range(1, attempts + 1):
+        try:
+            subprocess.check_call(cmd)
+            return
+        except subprocess.CalledProcessError:
+            if attempt == attempts:
+                raise
+            print(
+                f"[auto_uploadfs] Upload attempt {attempt} failed; "
+                "waiting for USB port to become available…"
+            )
+            time.sleep(2.0)
 
 
 env.AddPostAction("upload", upload_filesystem)

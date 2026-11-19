@@ -26,9 +26,13 @@
 #include "Safecast/SafecastPublisher.h"
 #include "Logging/LogCursorWindow.h"
 #include "Publishing/HttpPublishResponse.h"
+#include "NetworkStatus.h"
 
 #include <Arduino.h>
 #include <WiFiClientSecure.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <ETH.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -41,6 +45,16 @@
 
 namespace
 {
+constexpr int kEthSclkPin = 13;
+constexpr int kEthMisoPin = 12;
+constexpr int kEthMosiPin = 11;
+constexpr int kEthCsPin = 14;
+constexpr int kEthResetPin = 9;
+constexpr int kEthInterruptPin = 10;
+constexpr int kEthPhyAddress = 1;
+constexpr unsigned long kEthernetNoLinkGraceMs = 3000;
+constexpr unsigned long kEthernetDhcpWaitMs = 12000;
+
 constexpr const char kPortalHeadElement[] =
     "<style>"
     "html.portal-subtitle-pending body .wrap > h3{visibility:hidden;}"
@@ -258,6 +272,7 @@ WiFiPortalService::WiFiPortalService(AppConfig &config,
       deviceInfoPage_(info),
       bridgeInfoPage_(openSenseMapHealth, gmcMapHealth, radmonHealth, openRadiationHealth, safecastHealth),
       manager_(),
+      ethernetServer_(80),
       log_(logPort),
       led_(led),
       openRadiationHealth_(openRadiationHealth),
@@ -275,9 +290,44 @@ WiFiPortalService::WiFiPortalService(AppConfig &config,
 {
 }
 
-void WiFiPortalService::begin()
+
+WebServer *WiFiPortalService::activeServer()
 {
-    ensureCsrfToken();
+    if (ethernetPortalActive_)
+        return &ethernetServer_;
+    return manager_.server.get();
+}
+
+WebServer *WiFiPortalService::activeServer() const
+{
+    if (ethernetPortalActive_)
+        return const_cast<WebServer *>(&ethernetServer_);
+    return const_cast<WebServer *>(manager_.server.get());
+}
+
+bool WiFiPortalService::networkConnected() const
+{
+    return NetworkStatus::connected();
+}
+
+bool WiFiPortalService::usingEthernet() const
+{
+    return ethernetPortalActive_ && NetworkStatus::ethernetConnected();
+}
+
+IPAddress WiFiPortalService::networkIP() const
+{
+    if (usingEthernet())
+        return ETH.localIP();
+    return WiFi.localIP();
+}
+
+void WiFiPortalService::initializeWiFiManager()
+{
+    if (wifiManagerInitialized_)
+        return;
+
+    log_.println(F("Initializing Wi-Fi fallback."));
     manager_.setDebugOutput(true);
     manager_.setWiFiAutoReconnect(false);
     WiFi.setAutoReconnect(false);
@@ -298,10 +348,195 @@ void WiFiPortalService::begin()
             log_.print(F(", "));
     }
     log_.println();
+
     wifiEventId_ = WiFi.onEvent([this](WiFiEvent_t event, WiFiEventInfo_t info)
                                 { handleWiFiEvent(event, info); });
+
     attachParameters();
     refreshParameters();
+    wifiManagerInitialized_ = true;
+}
+
+void WiFiPortalService::initializeEthernet()
+{
+    if (ethernetStarted_)
+        return;
+
+    log_.println(F("Initializing Waveshare ESP32-S3-ETH W5500 Ethernet."));
+    SPI.begin(kEthSclkPin, kEthMisoPin, kEthMosiPin, kEthCsPin);
+
+    // Waveshare ESP32-S3-ETH:
+    //   SCLK=13, MISO=12, MOSI=11, CS=14, RESET=9, INT=10.
+    if (!ETH.begin(ETH_PHY_W5500, kEthPhyAddress, kEthCsPin, kEthInterruptPin, kEthResetPin, SPI))
+    {
+        log_.println(F("W5500 Ethernet initialization failed."));
+        return;
+    }
+
+    ethernetStarted_ = true;
+    const char *hostname = config_.deviceName.length() ? config_.deviceName.c_str() : "radpro-wifi-bridge";
+    if (!ETH.setHostname(hostname))
+        log_.println(F("Warning: unable to set Ethernet hostname."));
+    log_.println(F("W5500 Ethernet initialized; waiting for link/DHCP."));
+}
+
+bool WiFiPortalService::waitForPreferredEthernet()
+{
+    if (!ethernetStarted_)
+        return false;
+
+    const unsigned long startedAt = millis();
+    bool linkSeen = NetworkStatus::ethernetLinkUp();
+
+    while (!NetworkStatus::ethernetConnected())
+    {
+        const unsigned long elapsed = millis() - startedAt;
+        if (NetworkStatus::ethernetLinkUp())
+            linkSeen = true;
+
+        // With no physical link, fall back quickly.  Once link is detected,
+        // allow DHCP more time before deciding that wired networking is not usable.
+        if ((!linkSeen && elapsed >= kEthernetNoLinkGraceMs) ||
+            (linkSeen && elapsed >= kEthernetDhcpWaitMs))
+            break;
+
+        delay(50);
+        yield();
+    }
+
+    if (!NetworkStatus::ethernetConnected())
+    {
+        if (linkSeen)
+            log_.println(F("Ethernet link detected but no DHCP lease received; enabling Wi-Fi fallback."));
+        else
+            log_.println(F("No Ethernet link detected; enabling Wi-Fi fallback."));
+        return false;
+    }
+
+    return true;
+}
+
+void WiFiPortalService::startEthernetPortal()
+{
+    if (!NetworkStatus::ethernetConnected())
+        return;
+
+    if (!ethernetPortalActive_)
+    {
+        log_.print(F("Ethernet has IP "));
+        log_.print(ETH.localIP());
+        log_.println(F("; disabling Wi-Fi and starting Ethernet web portal."));
+
+        // Force all new outbound sockets onto the wired interface before the
+        // Wi-Fi radio is shut down.
+        ETH.setDefault();
+
+        if (wifiManagerInitialized_)
+        {
+            if (manager_.getConfigPortalActive())
+                manager_.stopConfigPortal();
+            if (manager_.getWebPortalActive())
+                manager_.stopWebPortal();
+
+            // Wi-Fi had previously been used as a fallback. Shut the radio
+            // completely down now that Ethernet owns the network.
+            WiFi.disconnect(true, false);
+            WiFi.mode(WIFI_OFF);
+        }
+
+        pendingReconnect_ = false;
+        waitingForIpSinceMs_ = 0;
+
+        led_.clearFault(FaultCode::WifiPortalStuck);
+        led_.clearFault(FaultCode::WifiDhcpFailure);
+        led_.clearFault(FaultCode::PortalReconnectFailed);
+        led_.clearFault(FaultCode::WifiAuthFailure);
+
+        ethernetPortalActive_ = true;
+    }
+
+    if (!ethernetRoutesRegistered_)
+    {
+        registerPortalRoutes();
+    }
+
+    if (!ethernetServerStarted_)
+    {
+        ethernetServer_.begin();
+        ethernetServerStarted_ = true;
+        log_.println(F("Ethernet web server listening on port 80."));
+    }
+}
+
+void WiFiPortalService::stopEthernetPortal()
+{
+    if (!ethernetPortalActive_)
+        return;
+
+    log_.println(F("Ethernet IP lost; stopping Ethernet web portal."));
+    ethernetServer_.stop();
+    ethernetServerStarted_ = false;
+    ethernetPortalActive_ = false;
+}
+
+void WiFiPortalService::maintainEthernet()
+{
+    if (!ethernetStarted_)
+        return;
+
+    const bool hasIp = NetworkStatus::ethernetConnected();
+
+    if (hasIp)
+    {
+        startEthernetPortal();
+    }
+    else if (ethernetPortalActive_)
+    {
+        stopEthernetPortal();
+    }
+}
+
+void WiFiPortalService::sendEthernetMainMenu()
+{
+    if (!activeServer())
+        return;
+
+    ensureMenuHtmlLoaded();
+    applyMenuHtmlForLocale(resolvePortalLocale());
+
+    TemplateReplacements vars;
+    appendCommonTemplateVars(vars);
+    String menu = menuHtmlRendered_;
+    applyTemplateReplacements(menu, vars);
+
+    String html;
+    html.reserve(menu.length() + 1200);
+    html += F("<!DOCTYPE html><html lang=\"");
+    html += resolvePortalLocale();
+    html += F("\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+    html += F("<title>RadPro WiFi Bridge</title><link rel=\"stylesheet\" href=\"/portal/portal.css\">");
+    html += kPortalHeadElement;
+    html += F("</head><body class=\"invert\"><div class=\"wrap\"><h1>RadPro WiFi Bridge</h1>");
+    html += menu;
+    html += F("</div></body></html>");
+
+    activeServer()->send(200, "text/html", html);
+}
+
+void WiFiPortalService::begin()
+{
+    ensureCsrfToken();
+
+    // Ethernet is deliberately evaluated before WiFiManager or any Wi-Fi API
+    // is initialized. This guarantees that a successful wired boot never starts
+    // STA mode, an AP, a scan, or a Wi-Fi connection attempt.
+    initializeEthernet();
+    waitForPreferredEthernet();
+    maintainEthernet();
+
+    if (!ethernetPortalActive_)
+        initializeWiFiManager();
+
     logStatusIfNeeded();
     dumpFilesystemContents(F("WiFiPortalService begin"));
     logPortalState("begin");
@@ -333,6 +568,14 @@ bool WiFiPortalService::connect(bool forcePortal)
     log_.println(F(") invoked."));
     logPortalState("connect(start)");
 
+    maintainEthernet();
+    if (ethernetPortalActive_)
+    {
+        log_.println(F("Ethernet is active; skipping Wi-Fi startup."));
+        return true;
+    }
+
+    initializeWiFiManager();
     refreshParameters();
 
     bool haveStoredCredentials = hasStoredCredentials();
@@ -360,14 +603,24 @@ bool WiFiPortalService::connect(bool forcePortal)
             prepareConfigPortalAp(apName);
         }
         manager_.setConfigPortalTimeout(0);
-        manager_.setConfigPortalBlocking(!recoveryPortal);
+        // Keep the portal non-blocking on Ethernet-capable hardware so a late
+        // DHCP lease can still be detected and immediately pre-empt Wi-Fi.
+        const bool backgroundPortal = recoveryPortal || ethernetStarted_;
+        manager_.setConfigPortalBlocking(!backgroundPortal);
         connected = manager_.startConfigPortal(apName.c_str());
-        if (recoveryPortal && manager_.getConfigPortalActive())
+        if (manager_.getConfigPortalActive())
         {
-            pendingReconnect_ = true;
-            lastReconnectAttemptMs_ = 0;
-            waitingForIpSinceMs_ = 0;
-            log_.println(F("Configuration portal running in background; stored Wi-Fi credentials will be retried."));
+            if (recoveryPortal)
+            {
+                pendingReconnect_ = true;
+                lastReconnectAttemptMs_ = 0;
+                waitingForIpSinceMs_ = 0;
+                log_.println(F("Configuration portal running in background; stored Wi-Fi credentials will be retried."));
+            }
+            else
+            {
+                log_.println(F("Configuration portal running in background for first-time setup."));
+            }
         }
         else
         {
@@ -386,8 +639,8 @@ bool WiFiPortalService::connect(bool forcePortal)
             logPortalState("autoConnect failed");
     }
 
-    const bool portalRunningForRecovery = recoveryPortal && manager_.getConfigPortalActive();
-    if (!connected && !portalRunningForRecovery)
+    const bool portalRunning = manager_.getConfigPortalActive();
+    if (!connected && !portalRunning)
     {
         led_.activateFault(FaultCode::WifiPortalStuck);
         log_.println(F("WiFiPortalService::connect() returning failure."));
@@ -417,6 +670,34 @@ bool WiFiPortalService::connect(bool forcePortal)
 
 void WiFiPortalService::maintain()
 {
+    const bool wasUsingEthernet = ethernetPortalActive_;
+    maintainEthernet();
+
+    if (ethernetPortalActive_)
+    {
+        // Ethernet is the primary network. Do not start, scan, reconnect, or
+        // expose a Wi-Fi AP while the wired interface has an IP address.
+        ethernetServer_.handleClient();
+
+        if (restartScheduled_ && millis() >= restartAtMs_)
+        {
+            log_.println(F("Restarting device to apply configuration changes."));
+            delay(100);
+            ESP.restart();
+        }
+        return;
+    }
+
+    if (wasUsingEthernet && !NetworkStatus::ethernetConnected())
+    {
+        log_.println(F("Ethernet disconnected; falling back to Wi-Fi."));
+        initializeWiFiManager();
+        WiFi.mode(WIFI_STA);
+        WiFi.setHostname(config_.deviceName.c_str());
+        connect(false);
+        return;
+    }
+
     const bool connected = WiFi.status() == WL_CONNECTED;
     const unsigned long now = millis();
     bool configPortalActive = manager_.getConfigPortalActive();
@@ -548,7 +829,13 @@ void WiFiPortalService::maintain()
 
 void WiFiPortalService::process()
 {
-    if (manager_.getWebPortalActive() || manager_.getConfigPortalActive())
+    if (ethernetPortalActive_)
+    {
+        // Ethernet server is serviced from maintain(); nothing else is needed here.
+        return;
+    }
+
+    if (wifiManagerInitialized_ && (manager_.getWebPortalActive() || manager_.getConfigPortalActive()))
     {
         manager_.process();
     }
@@ -608,317 +895,332 @@ void WiFiPortalService::attachParameters()
     }
 
     manager_.setWebServerCallback([this]()
-                                  {
-        log_.println(F("Web server callback invoked; registering custom portal routes."));
-        if (!manager_.server)
-        {
-            log_.println(F("manager_.server is null; cannot register custom routes."));
-            return;
-        }
-        routesRegistered_ = true;
-        log_.println(F("Custom Wi-Fi portal routes: /mqtt /osem /radmon /openradiation /openradiation/dry-run /openradiation/latest /gmc /safecast /device /device.json /bridge /bridge.json /backup /backup.json /backup/restore /logs /logs.json /ota /ota/status /ota/fetch /ota/upload/* /restart"));
+                                  { registerPortalRoutes(); });
 
-        manager_.server->on("/mqtt", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /mqtt"));
-            MqttPublisher::SendPortalForm(*this);
-        });
-
-        manager_.server->on("/portal/portal.css", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /portal/portal.css"));
-            if (!sendStaticFile("/portal/portal.css", "text/css"))
-                sendTemplateError("/portal/portal.css");
-        });
-
-        manager_.server->on("/portal/portal-head-bootstrap.js", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /portal/portal-head-bootstrap.js"));
-            if (!sendStaticFile("/portal/portal-head-bootstrap.js", "application/javascript"))
-                sendTemplateError("/portal/portal-head-bootstrap.js");
-        });
-
-        manager_.server->on("/portal/js/device-info.js", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /portal/js/device-info.js"));
-            if (!sendStaticFile("/portal/js/device-info.js", "application/javascript"))
-                sendTemplateError("/portal/js/device-info.js");
-        });
-
-        manager_.server->on("/portal/js/bridge-info.js", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /portal/js/bridge-info.js"));
-            if (!sendStaticFile("/portal/js/bridge-info.js", "application/javascript"))
-                sendTemplateError("/portal/js/bridge-info.js");
-        });
-
-        manager_.server->on("/portal/js/backup-page.js", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /portal/js/backup-page.js"));
-            if (!sendStaticFile("/portal/js/backup-page.js", "application/javascript"))
-                sendTemplateError("/portal/js/backup-page.js");
-        });
-
-        manager_.server->on("/portal/js/log-console.js", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /portal/js/log-console.js"));
-            if (!sendStaticFile("/portal/js/log-console.js", "application/javascript"))
-                sendTemplateError("/portal/js/log-console.js");
-        });
-
-        manager_.server->on("/portal/portal-locale.js", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /portal/portal-locale.js"));
-            if (!sendStaticFile("/portal/portal-locale.js", "application/javascript"))
-                sendTemplateError("/portal/portal-locale.js");
-        });
-
-        manager_.server->on("/portal/locales/en.json", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /portal/locales/en.json"));
-            if (!sendStaticFile("/portal/locales/en.json", "application/json"))
-                sendTemplateError("/portal/locales/en.json");
-        });
-
-        manager_.server->on("/portal/locales/de.json", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /portal/locales/de.json"));
-            if (!sendStaticFile("/portal/locales/de.json", "application/json"))
-                sendTemplateError("/portal/locales/de.json");
-        });
-
-        manager_.server->on("/portal/js/ota-page.js", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /portal/js/ota-page.js"));
-            if (!sendStaticFile("/portal/js/ota-page.js", "application/javascript"))
-                sendTemplateError("/portal/js/ota-page.js");
-        });
-
-        manager_.server->on("/portal/js/jszip.min.js", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /portal/js/jszip.min.js"));
-            if (!sendStaticFile("/portal/js/jszip.min.js", "application/javascript"))
-                sendTemplateError("/portal/js/jszip.min.js");
-        });
-
-        manager_.server->on("/mqtt", HTTP_POST, [this]() {
-            log_.println(F("HTTP POST /mqtt"));
-            if (!manager_.server)
-                return;
-            if (!requirePortalPost("/mqtt", {"mqttHost", "mqttPort", "mqttClient", "mqttUser", "mqttPass", "mqttTopic", "mqttFullTopic", "readInterval"}))
-                return;
-            String message;
-            bool needsReconnect = MqttPublisher::HandlePortalPost(*manager_.server, config_, store_, led_, log_, message);
-            if (needsReconnect)
-            {
-                pendingReconnect_ = true;
-                lastReconnectAttemptMs_ = 0;
-                hasLoggedIp_ = false;
-            }
-            MqttPublisher::SendPortalForm(*this, message);
-        });
-
-        manager_.server->on("/osem", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /osem"));
-            OpenSenseMapPublisher::SendPortalForm(*this);
-        });
-
-        manager_.server->on("/osem", HTTP_POST, [this]() {
-            log_.println(F("HTTP POST /osem"));
-            if (!manager_.server)
-                return;
-            if (!requirePortalPost("/osem", {"osemBoxId", "osemApiKey", "osemRate", "osemDose"}))
-                return;
-            String message;
-            OpenSenseMapPublisher::HandlePortalPost(*manager_.server, config_, store_, led_, log_, message);
-            OpenSenseMapPublisher::SendPortalForm(*this, message);
-        });
-
-        manager_.server->on("/radmon", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /radmon"));
-            RadmonPublisher::SendPortalForm(*this);
-        });
-
-        manager_.server->on("/radmon", HTTP_POST, [this]() {
-            log_.println(F("HTTP POST /radmon"));
-            if (!manager_.server)
-                return;
-            if (!requirePortalPost("/radmon", {"radmonUser", "radmonPass"}))
-                return;
-            String message;
-            RadmonPublisher::HandlePortalPost(*manager_.server, config_, store_, led_, log_, message);
-            RadmonPublisher::SendPortalForm(*this, message);
-        });
-
-        manager_.server->on("/openradiation", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /openradiation"));
-            sendOpenRadiationForm();
-        });
-
-        manager_.server->on("/openradiation", HTTP_POST, [this]() {
-            log_.println(F("HTTP POST /openradiation"));
-            if (!requirePortalPost("/openradiation", {"orDeviceId", "orApiKey", "orUserId", "orUserPwd", "orLatitude", "orLongitude", "orAltitude", "orAccuracy", "orMeasurementEnvironment", "orMeasurementHeight"}))
-                return;
-            handleOpenRadiationPost();
-        });
-
-        manager_.server->on("/openradiation/dry-run", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /openradiation/dry-run"));
-            handleOpenRadiationDryRun();
-        });
-
-        manager_.server->on("/openradiation/latest", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /openradiation/latest"));
-            handleOpenRadiationLatest();
-        });
-
-        manager_.server->on("/gmc", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /gmc"));
-            GmcMapPublisher::SendPortalForm(*this);
-        });
-
-        manager_.server->on("/gmc", HTTP_POST, [this]() {
-            log_.println(F("HTTP POST /gmc"));
-            if (!manager_.server)
-                return;
-            if (!requirePortalPost("/gmc", {"gmcAccount", "gmcDevice"}))
-                return;
-            String message;
-            GmcMapPublisher::HandlePortalPost(*manager_.server, config_, store_, led_, log_, message);
-            GmcMapPublisher::SendPortalForm(*this, message);
-        });
-
-        manager_.server->on("/safecast", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /safecast"));
-            sendSafecastForm(config_);
-        });
-
-        manager_.server->on("/safecast", HTTP_POST, [this]() {
-            log_.println(F("HTTP POST /safecast"));
-            if (!requirePortalPost("/safecast", {"safecastAction", "safecastApiBaseUrl", "safecastCustomApiBaseUrl", "safecastApiKey", "safecastDeviceId", "safecastLatitude", "safecastLongitude", "safecastHeightCm", "safecastLocationName", "safecastUnit", "safecastUploadIntervalSeconds"}))
-                return;
-            handleSafecastPost();
-        });
-
-        manager_.server->on("/device", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /device"));
-            TemplateReplacements vars;
-            appendCommonTemplateVars(vars);
-            sendTemplate("/portal/device-info.html", vars);
-        });
-
-        manager_.server->on("/device.json", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /device.json"));
-            deviceInfoPage_.handleJson(&manager_);
-        });
-
-        manager_.server->on("/bridge", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /bridge"));
-            TemplateReplacements vars;
-            appendCommonTemplateVars(vars);
-            sendTemplate("/portal/bridge-info.html", vars);
-        });
-
-        manager_.server->on("/bridge.json", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /bridge.json"));
-            bridgeInfoPage_.handleJson(&manager_);
-        });
-
-        manager_.server->on("/logs", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /logs"));
-            TemplateReplacements vars;
-            appendCommonTemplateVars(vars);
-            sendTemplate("/portal/logs.html", vars);
-        });
-
-        manager_.server->on("/logs.json", HTTP_GET, [this]() {
-            handleLogsJson();
-        });
-
-        manager_.server->on("/backup", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /backup"));
-            sendConfigBackupPage();
-        });
-
-        manager_.server->on("/backup.json", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /backup.json"));
-            handleConfigDownload();
-        });
-
-        manager_.server->on("/backup/restore", HTTP_POST, [this]() {
-            log_.println(F("HTTP POST /backup/restore"));
-            if (!requirePortalPost("/backup/restore", {"configJson"}))
-                return;
-            handleConfigRestore();
-        });
-
-        manager_.server->on("/ota", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /ota"));
-            sendOtaPage();
-        });
-
-        manager_.server->on("/ota/status", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /ota/status"));
-            handleOtaStatus();
-        });
-
-        manager_.server->on("/ota/fetch", HTTP_POST, [this]() {
-            log_.println(F("HTTP POST /ota/fetch"));
-            if (!requirePortalPost("/ota/fetch", {}, true))
-                return;
-            handleOtaFetch();
-        });
-
-        manager_.server->on("/ota/upload/begin", HTTP_POST, [this]() {
-            log_.println(F("HTTP POST /ota/upload/begin"));
-            if (!requirePortalPost("/ota/upload/begin", {"plain"}, true))
-                return;
-            handleOtaUploadBegin();
-        });
-
-        manager_.server->on("/ota/upload/part/begin", HTTP_POST, [this]() {
-            log_.println(F("HTTP POST /ota/upload/part/begin"));
-            if (!requirePortalPost("/ota/upload/part/begin", {"path", "offset", "size"}, true))
-                return;
-            handleOtaUploadPartBegin();
-        });
-
-        manager_.server->on("/ota/upload/part/chunk", HTTP_POST, [this]() {
-            if (!requirePortalPost("/ota/upload/part/chunk", {"plain"}, true))
-                return;
-            handleOtaUploadPartChunk();
-        });
-
-        manager_.server->on("/ota/upload/part/finish", HTTP_POST, [this]() {
-            log_.println(F("HTTP POST /ota/upload/part/finish"));
-            if (!requirePortalPost("/ota/upload/part/finish", {"path"}, true))
-                return;
-            handleOtaUploadPartFinish();
-        });
-
-        manager_.server->on("/ota/upload/finish", HTTP_POST, [this]() {
-            log_.println(F("HTTP POST /ota/upload/finish"));
-            if (!requirePortalPost("/ota/upload/finish", {}, true))
-                return;
-            handleOtaUploadFinish();
-        });
-
-        manager_.server->on("/ota/cancel", HTTP_POST, [this]() {
-            log_.println(F("HTTP POST /ota/cancel"));
-            if (!requirePortalPost("/ota/cancel", {}, true))
-                return;
-            handleOtaCancel();
-        });
-
-        manager_.server->on("/restart", HTTP_GET, [this]() {
-            log_.println(F("HTTP GET /restart"));
-            manager_.server->send(200, "text/plain", "Restarting...\n");
-            log_.println("Restart requested from Wi-Fi portal.");
-            delay(200);
-            ESP.restart();
-        });
-
-        manager_.server->onNotFound([this]() {
-            if (!manager_.server)
-                return;
-            log_.print(F("Portal request not found: "));
-            log_.print(manager_.server->uri());
-            log_.print(F(" (method "));
-            log_.print(manager_.server->method());
-            log_.println(F(")"));
-            manager_.handleNotFound();
-        }); });
-
-    log_.println(F("Custom Wi-Fi portal routes registered."));
+    log_.println(F("Custom network portal routes registered."));
     paramsAttached_ = true;
+}
+
+void WiFiPortalService::registerPortalRoutes()
+{
+
+log_.println(F("Web server callback invoked; registering custom portal routes."));
+if (!activeServer())
+{
+    log_.println(F("activeServer() is null; cannot register custom routes."));
+    return;
+}
+if (ethernetPortalActive_)
+    ethernetRoutesRegistered_ = true;
+else
+    routesRegistered_ = true;
+log_.println(F("Custom network portal routes: /mqtt /osem /radmon /openradiation /openradiation/dry-run /openradiation/latest /gmc /safecast /device /device.json /bridge /bridge.json /backup /backup.json /backup/restore /logs /logs.json /ota /ota/status /ota/fetch /ota/upload/* /restart"));
+
+        if (ethernetPortalActive_)
+        {
+            activeServer()->on("/", HTTP_GET, [this]() {
+                log_.println(F("HTTP GET / (Ethernet main menu)"));
+                sendEthernetMainMenu();
+            });
+        }
+
+activeServer()->on("/mqtt", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /mqtt"));
+    MqttPublisher::SendPortalForm(*this);
+});
+
+activeServer()->on("/portal/portal.css", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /portal/portal.css"));
+    if (!sendStaticFile("/portal/portal.css", "text/css"))
+        sendTemplateError("/portal/portal.css");
+});
+
+activeServer()->on("/portal/portal-head-bootstrap.js", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /portal/portal-head-bootstrap.js"));
+    if (!sendStaticFile("/portal/portal-head-bootstrap.js", "application/javascript"))
+        sendTemplateError("/portal/portal-head-bootstrap.js");
+});
+
+activeServer()->on("/portal/js/device-info.js", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /portal/js/device-info.js"));
+    if (!sendStaticFile("/portal/js/device-info.js", "application/javascript"))
+        sendTemplateError("/portal/js/device-info.js");
+});
+
+activeServer()->on("/portal/js/bridge-info.js", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /portal/js/bridge-info.js"));
+    if (!sendStaticFile("/portal/js/bridge-info.js", "application/javascript"))
+        sendTemplateError("/portal/js/bridge-info.js");
+});
+
+activeServer()->on("/portal/js/backup-page.js", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /portal/js/backup-page.js"));
+    if (!sendStaticFile("/portal/js/backup-page.js", "application/javascript"))
+        sendTemplateError("/portal/js/backup-page.js");
+});
+
+activeServer()->on("/portal/js/log-console.js", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /portal/js/log-console.js"));
+    if (!sendStaticFile("/portal/js/log-console.js", "application/javascript"))
+        sendTemplateError("/portal/js/log-console.js");
+});
+
+activeServer()->on("/portal/portal-locale.js", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /portal/portal-locale.js"));
+    if (!sendStaticFile("/portal/portal-locale.js", "application/javascript"))
+        sendTemplateError("/portal/portal-locale.js");
+});
+
+activeServer()->on("/portal/locales/en.json", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /portal/locales/en.json"));
+    if (!sendStaticFile("/portal/locales/en.json", "application/json"))
+        sendTemplateError("/portal/locales/en.json");
+});
+
+activeServer()->on("/portal/locales/de.json", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /portal/locales/de.json"));
+    if (!sendStaticFile("/portal/locales/de.json", "application/json"))
+        sendTemplateError("/portal/locales/de.json");
+});
+
+activeServer()->on("/portal/js/ota-page.js", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /portal/js/ota-page.js"));
+    if (!sendStaticFile("/portal/js/ota-page.js", "application/javascript"))
+        sendTemplateError("/portal/js/ota-page.js");
+});
+
+activeServer()->on("/portal/js/jszip.min.js", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /portal/js/jszip.min.js"));
+    if (!sendStaticFile("/portal/js/jszip.min.js", "application/javascript"))
+        sendTemplateError("/portal/js/jszip.min.js");
+});
+
+activeServer()->on("/mqtt", HTTP_POST, [this]() {
+    log_.println(F("HTTP POST /mqtt"));
+    if (!activeServer())
+        return;
+    if (!requirePortalPost("/mqtt", {"mqttHost", "mqttPort", "mqttClient", "mqttUser", "mqttPass", "mqttTopic", "mqttFullTopic", "readInterval"}))
+        return;
+    String message;
+    bool needsReconnect = MqttPublisher::HandlePortalPost(*activeServer(), config_, store_, led_, log_, message);
+    if (needsReconnect)
+    {
+        pendingReconnect_ = true;
+        lastReconnectAttemptMs_ = 0;
+        hasLoggedIp_ = false;
+    }
+    MqttPublisher::SendPortalForm(*this, message);
+});
+
+activeServer()->on("/osem", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /osem"));
+    OpenSenseMapPublisher::SendPortalForm(*this);
+});
+
+activeServer()->on("/osem", HTTP_POST, [this]() {
+    log_.println(F("HTTP POST /osem"));
+    if (!activeServer())
+        return;
+    if (!requirePortalPost("/osem", {"osemBoxId", "osemApiKey", "osemRate", "osemDose"}))
+        return;
+    String message;
+    OpenSenseMapPublisher::HandlePortalPost(*activeServer(), config_, store_, led_, log_, message);
+    OpenSenseMapPublisher::SendPortalForm(*this, message);
+});
+
+activeServer()->on("/radmon", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /radmon"));
+    RadmonPublisher::SendPortalForm(*this);
+});
+
+activeServer()->on("/radmon", HTTP_POST, [this]() {
+    log_.println(F("HTTP POST /radmon"));
+    if (!activeServer())
+        return;
+    if (!requirePortalPost("/radmon", {"radmonUser", "radmonPass"}))
+        return;
+    String message;
+    RadmonPublisher::HandlePortalPost(*activeServer(), config_, store_, led_, log_, message);
+    RadmonPublisher::SendPortalForm(*this, message);
+});
+
+activeServer()->on("/openradiation", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /openradiation"));
+    sendOpenRadiationForm();
+});
+
+activeServer()->on("/openradiation", HTTP_POST, [this]() {
+    log_.println(F("HTTP POST /openradiation"));
+    if (!requirePortalPost("/openradiation", {"orDeviceId", "orApiKey", "orUserId", "orUserPwd", "orLatitude", "orLongitude", "orAltitude", "orAccuracy", "orMeasurementEnvironment", "orMeasurementHeight"}))
+        return;
+    handleOpenRadiationPost();
+});
+
+activeServer()->on("/openradiation/dry-run", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /openradiation/dry-run"));
+    handleOpenRadiationDryRun();
+});
+
+activeServer()->on("/openradiation/latest", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /openradiation/latest"));
+    handleOpenRadiationLatest();
+});
+
+activeServer()->on("/gmc", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /gmc"));
+    GmcMapPublisher::SendPortalForm(*this);
+});
+
+activeServer()->on("/gmc", HTTP_POST, [this]() {
+    log_.println(F("HTTP POST /gmc"));
+    if (!activeServer())
+        return;
+    if (!requirePortalPost("/gmc", {"gmcAccount", "gmcDevice"}))
+        return;
+    String message;
+    GmcMapPublisher::HandlePortalPost(*activeServer(), config_, store_, led_, log_, message);
+    GmcMapPublisher::SendPortalForm(*this, message);
+});
+
+activeServer()->on("/safecast", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /safecast"));
+    sendSafecastForm(config_);
+});
+
+activeServer()->on("/safecast", HTTP_POST, [this]() {
+    log_.println(F("HTTP POST /safecast"));
+    if (!requirePortalPost("/safecast", {"safecastAction", "safecastApiBaseUrl", "safecastCustomApiBaseUrl", "safecastApiKey", "safecastDeviceId", "safecastLatitude", "safecastLongitude", "safecastHeightCm", "safecastLocationName", "safecastUnit", "safecastUploadIntervalSeconds"}))
+        return;
+    handleSafecastPost();
+});
+
+activeServer()->on("/device", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /device"));
+    TemplateReplacements vars;
+    appendCommonTemplateVars(vars);
+    sendTemplate("/portal/device-info.html", vars);
+});
+
+activeServer()->on("/device.json", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /device.json"));
+    deviceInfoPage_.handleJson(activeServer());
+});
+
+activeServer()->on("/bridge", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /bridge"));
+    TemplateReplacements vars;
+    appendCommonTemplateVars(vars);
+    sendTemplate("/portal/bridge-info.html", vars);
+});
+
+activeServer()->on("/bridge.json", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /bridge.json"));
+    bridgeInfoPage_.handleJson(activeServer());
+});
+
+activeServer()->on("/logs", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /logs"));
+    TemplateReplacements vars;
+    appendCommonTemplateVars(vars);
+    sendTemplate("/portal/logs.html", vars);
+});
+
+activeServer()->on("/logs.json", HTTP_GET, [this]() {
+    handleLogsJson();
+});
+
+activeServer()->on("/backup", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /backup"));
+    sendConfigBackupPage();
+});
+
+activeServer()->on("/backup.json", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /backup.json"));
+    handleConfigDownload();
+});
+
+activeServer()->on("/backup/restore", HTTP_POST, [this]() {
+    log_.println(F("HTTP POST /backup/restore"));
+    if (!requirePortalPost("/backup/restore", {"configJson"}))
+        return;
+    handleConfigRestore();
+});
+
+activeServer()->on("/ota", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /ota"));
+    sendOtaPage();
+});
+
+activeServer()->on("/ota/status", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /ota/status"));
+    handleOtaStatus();
+});
+
+activeServer()->on("/ota/fetch", HTTP_POST, [this]() {
+    log_.println(F("HTTP POST /ota/fetch"));
+    if (!requirePortalPost("/ota/fetch", {}, true))
+        return;
+    handleOtaFetch();
+});
+
+activeServer()->on("/ota/upload/begin", HTTP_POST, [this]() {
+    log_.println(F("HTTP POST /ota/upload/begin"));
+    if (!requirePortalPost("/ota/upload/begin", {"plain"}, true))
+        return;
+    handleOtaUploadBegin();
+});
+
+activeServer()->on("/ota/upload/part/begin", HTTP_POST, [this]() {
+    log_.println(F("HTTP POST /ota/upload/part/begin"));
+    if (!requirePortalPost("/ota/upload/part/begin", {"path", "offset", "size"}, true))
+        return;
+    handleOtaUploadPartBegin();
+});
+
+activeServer()->on("/ota/upload/part/chunk", HTTP_POST, [this]() {
+    if (!requirePortalPost("/ota/upload/part/chunk", {"plain"}, true))
+        return;
+    handleOtaUploadPartChunk();
+});
+
+activeServer()->on("/ota/upload/part/finish", HTTP_POST, [this]() {
+    log_.println(F("HTTP POST /ota/upload/part/finish"));
+    if (!requirePortalPost("/ota/upload/part/finish", {"path"}, true))
+        return;
+    handleOtaUploadPartFinish();
+});
+
+activeServer()->on("/ota/upload/finish", HTTP_POST, [this]() {
+    log_.println(F("HTTP POST /ota/upload/finish"));
+    if (!requirePortalPost("/ota/upload/finish", {}, true))
+        return;
+    handleOtaUploadFinish();
+});
+
+activeServer()->on("/ota/cancel", HTTP_POST, [this]() {
+    log_.println(F("HTTP POST /ota/cancel"));
+    if (!requirePortalPost("/ota/cancel", {}, true))
+        return;
+    handleOtaCancel();
+});
+
+activeServer()->on("/restart", HTTP_GET, [this]() {
+    log_.println(F("HTTP GET /restart"));
+    activeServer()->send(200, "text/plain", "Restarting...\n");
+    log_.println("Restart requested from network portal.");
+    delay(200);
+    ESP.restart();
+});
+
+activeServer()->onNotFound([this]() {
+    if (!activeServer())
+        return;
+    log_.print(F("Portal request not found: "));
+    log_.print(activeServer()->uri());
+    log_.print(F(" (method "));
+    log_.print(activeServer()->method());
+    log_.println(F(")"));
+    activeServer()->send(404, "text/plain", "Not found\n");});
 }
 
 void WiFiPortalService::handleWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
@@ -1059,6 +1361,22 @@ void WiFiPortalService::handleWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
 
 void WiFiPortalService::logStatusIfNeeded()
 {
+    if (NetworkStatus::ethernetConnected())
+    {
+        if (loggingEnabled_ && (!hasLoggedIp_ || lastIp_ != ETH.localIP()))
+        {
+            lastIp_ = ETH.localIP();
+            hasLoggedIp_ = true;
+            log_.print(F("Ethernet connected: "));
+            log_.println(ETH.localIP());
+            log_.print(F("Gateway: "));
+            log_.print(ETH.gatewayIP());
+            log_.print(F("  Mask: "));
+            log_.println(ETH.subnetMask());
+        }
+        return;
+    }
+
     wl_status_t current = WiFi.status();
     if (current != lastStatus_)
     {
@@ -1124,6 +1442,19 @@ void WiFiPortalService::logStatus()
     if (!loggingEnabled_)
         return;
 
+    if (NetworkStatus::ethernetConnected())
+    {
+        lastIp_ = ETH.localIP();
+        hasLoggedIp_ = true;
+        log_.print(F("Ethernet connected: "));
+        log_.println(ETH.localIP());
+        log_.print(F("Gateway: "));
+        log_.print(ETH.gatewayIP());
+        log_.print(F("  Mask: "));
+        log_.println(ETH.subnetMask());
+        return;
+    }
+
     wl_status_t status = WiFi.status();
     if (status == WL_CONNECTED)
     {
@@ -1137,6 +1468,28 @@ void WiFiPortalService::logStatus()
 
 void WiFiPortalService::logPortalState(const char *context)
 {
+    if (ethernetPortalActive_)
+    {
+        log_.print(F("Portal state"));
+        if (context && context[0])
+        {
+            log_.print(F(" ("));
+            log_.print(context);
+            log_.print(F(")"));
+        }
+        log_.print(F(": Ethernet IP="));
+        log_.print(ETH.localIP());
+        log_.print(F(" webServer="));
+        log_.println(ethernetServerStarted_ ? F("yes") : F("no"));
+        return;
+    }
+
+    if (!wifiManagerInitialized_)
+    {
+        log_.println(F("Portal state: Wi-Fi not initialized."));
+        return;
+    }
+
     log_.print(F("Portal state"));
     if (context && context[0])
     {
@@ -1473,7 +1826,7 @@ void WiFiPortalService::attemptReconnect()
 
 void WiFiPortalService::sendConfigBackupPage(const String &message)
 {
-    if (!manager_.server)
+    if (!activeServer())
         return;
 
     bool isError = message.startsWith(F("ERROR:"));
@@ -1501,10 +1854,10 @@ void WiFiPortalService::sendConfigBackupPage(const String &message)
 
 void WiFiPortalService::handleConfigDownload()
 {
-    if (!manager_.server)
+    if (!activeServer())
         return;
 
-    auto &server = *manager_.server;
+    auto &server = *activeServer();
     String json = exportConfigJson();
     server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     server.sendHeader("Pragma", "no-cache");
@@ -1515,10 +1868,10 @@ void WiFiPortalService::handleConfigDownload()
 
 void WiFiPortalService::handleConfigRestore()
 {
-    if (!manager_.server)
+    if (!activeServer())
         return;
 
-    auto &server = *manager_.server;
+    auto &server = *activeServer();
     String body;
     if (server.hasArg("configJson"))
         body = server.arg("configJson");
@@ -1722,7 +2075,7 @@ void WiFiPortalService::sendSafecastForm(const AppConfig &viewConfig,
                                          const String &message,
                                          const String &resultHtml)
 {
-    if (!manager_.server)
+    if (!activeServer())
         return;
 
     const String apiKeyPlaceholder = SafecastLogRedaction::maskSecretForDisplay(viewConfig.safecastApiKey);
@@ -1757,10 +2110,10 @@ void WiFiPortalService::sendSafecastForm(const AppConfig &viewConfig,
 
 void WiFiPortalService::handleSafecastPost()
 {
-    if (!manager_.server)
+    if (!activeServer())
         return;
 
-    auto &server = *manager_.server;
+    auto &server = *activeServer();
     AppConfig candidate = config_;
 
     candidate.safecastEnabled = server.hasArg("safecastEnabled") && server.arg("safecastEnabled") == "1";
@@ -1858,7 +2211,7 @@ void WiFiPortalService::handleSafecastPost()
 
 void WiFiPortalService::sendOpenRadiationForm(const String &message)
 {
-    if (!manager_.server)
+    if (!activeServer())
         return;
 
     const PublisherHealthSnapshot health = openRadiationHealth_.snapshot();
@@ -1946,15 +2299,15 @@ void WiFiPortalService::sendOpenRadiationForm(const String &message)
               "<form action='/' method='get' style='margin-top:20px;'><button class='btn btn-primary' type='submit'>Main menu</button></form>"
               "</div></body></html>");
 
-    manager_.server->send(200, "text/html", html);
+    activeServer()->send(200, "text/html", html);
 }
 
 void WiFiPortalService::handleOpenRadiationPost()
 {
-    if (!manager_.server)
+    if (!activeServer())
         return;
 
-    auto &server = *manager_.server;
+    auto &server = *activeServer();
     bool enabled = server.hasArg("orEnabled") && server.arg("orEnabled") == "1";
     String deviceId = server.arg("orDeviceId");
     String apiKey = server.arg("orApiKey");
@@ -2108,7 +2461,7 @@ void WiFiPortalService::handleOpenRadiationPost()
 
 void WiFiPortalService::handleOpenRadiationDryRun()
 {
-    if (!manager_.server)
+    if (!activeServer())
         return;
 
     String payload;
@@ -2119,16 +2472,16 @@ void WiFiPortalService::handleOpenRadiationDryRun()
         doc["error"] = String("OpenRadiation dry-run unavailable: ") + error;
         String body;
         serializeJsonPretty(doc, body);
-        manager_.server->send(503, "application/json", body);
+        activeServer()->send(503, "application/json", body);
         return;
     }
 
-    manager_.server->send(200, "application/json", payload);
+    activeServer()->send(200, "application/json", payload);
 }
 
 void WiFiPortalService::handleOpenRadiationLatest()
 {
-    if (!manager_.server)
+    if (!activeServer())
         return;
 
     const String reportUuid = openRadiationHealth_.snapshot().lastReportUuid;
@@ -2136,7 +2489,7 @@ void WiFiPortalService::handleOpenRadiationLatest()
     {
         OpenRadiationPortalView::LatestMeasurementViewModel model;
         model.errorMessage = "No successful OpenRadiation publish has been recorded yet.";
-        manager_.server->send(404, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
+        activeServer()->send(404, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
         return;
     }
 
@@ -2145,7 +2498,7 @@ void WiFiPortalService::handleOpenRadiationLatest()
     {
         OpenRadiationPortalView::LatestMeasurementViewModel model;
         model.errorMessage = "OpenRadiation lookup is unavailable because the API key or report UUID is missing.";
-        manager_.server->send(503, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
+        activeServer()->send(503, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
         return;
     }
 
@@ -2157,7 +2510,7 @@ void WiFiPortalService::handleOpenRadiationLatest()
     {
         OpenRadiationPortalView::LatestMeasurementViewModel model;
         model.errorMessage = "Could not connect to request.openradiation.net.";
-        manager_.server->send(502, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
+        activeServer()->send(502, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
         return;
     }
 
@@ -2177,7 +2530,7 @@ void WiFiPortalService::handleOpenRadiationLatest()
     {
         OpenRadiationPortalView::LatestMeasurementViewModel model;
         model.errorMessage = "Failed to send the OpenRadiation lookup request.";
-        manager_.server->send(502, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
+        activeServer()->send(502, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
         return;
     }
 
@@ -2202,7 +2555,7 @@ void WiFiPortalService::handleOpenRadiationLatest()
             model.errorMessage += " Response: ";
             model.errorMessage += body;
         }
-        manager_.server->send(response.statusCode == 404 ? 404 : 502, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
+        activeServer()->send(response.statusCode == 404 ? 404 : 502, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
         return;
     }
 
@@ -2213,7 +2566,7 @@ void WiFiPortalService::handleOpenRadiationLatest()
     {
         OpenRadiationPortalView::LatestMeasurementViewModel model;
         model.errorMessage = "OpenRadiation lookup returned an unexpected JSON payload.";
-        manager_.server->send(502, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
+        activeServer()->send(502, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
         return;
     }
 
@@ -2228,7 +2581,7 @@ void WiFiPortalService::handleOpenRadiationLatest()
     const float longitude = data["longitude"] | config_.openRadiationLongitude;
     model.mapUrl = OpenRadiationPortalLinks::buildOpenRadiationMapUrl(latitude, longitude);
 
-    manager_.server->send(200, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
+    activeServer()->send(200, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
 }
 
 String WiFiPortalService::htmlEscape(const String &value)
@@ -2307,7 +2660,7 @@ bool WiFiPortalService::readFile(const char *path, String &out)
 
 bool WiFiPortalService::sendStaticFile(const char *path, const char *contentType)
 {
-    if (!manager_.server)
+    if (!activeServer())
         return false;
 
     File file = LittleFS.open(path, "r");
@@ -2332,7 +2685,7 @@ bool WiFiPortalService::sendStaticFile(const char *path, const char *contentType
     log_.print(F(" size="));
     log_.println(file.size());
 
-    size_t sent = manager_.server->streamFile(file, contentType);
+    size_t sent = activeServer()->streamFile(file, contentType);
     file.close();
 
     if (sent == 0)
@@ -2359,7 +2712,7 @@ void WiFiPortalService::applyTemplateReplacements(String &content, const Templat
 
 bool WiFiPortalService::sendTemplate(const char *path, const TemplateReplacements &replacements)
 {
-    if (!manager_.server)
+    if (!activeServer())
     {
         log_.print(F("Cannot send template "));
         log_.print(path);
@@ -2389,7 +2742,7 @@ bool WiFiPortalService::sendTemplate(const char *path, const TemplateReplacement
 
     applyTemplateReplacements(content, replacements);
 
-    manager_.server->send(200, "text/html", content);
+    activeServer()->send(200, "text/html", content);
     log_.print(F("Served template OK: "));
     log_.println(path);
     return true;
@@ -2447,14 +2800,14 @@ String WiFiPortalService::csrfHiddenInput() const
 
 String WiFiPortalService::currentClientIp() const
 {
-    if (!manager_.server)
+    if (!activeServer())
         return String();
-    return manager_.server->client().remoteIP().toString();
+    return activeServer()->client().remoteIP().toString();
 }
 
 void WiFiPortalService::rejectPortalPost(const char *route, int code, const String &message, bool jsonResponse)
 {
-    if (!manager_.server)
+    if (!activeServer())
         return;
 
     log_.print(F("Rejected POST "));
@@ -2474,18 +2827,18 @@ void WiFiPortalService::rejectPortalPost(const char *route, int code, const Stri
         return;
     }
 
-    manager_.server->send(code, "text/plain", message + "\n");
+    activeServer()->send(code, "text/plain", message + "\n");
 }
 
 bool WiFiPortalService::requirePortalPost(const char *route,
                                           std::initializer_list<const char *> requiredFields,
                                           bool jsonResponse)
 {
-    if (!manager_.server)
+    if (!activeServer())
         return false;
 
     ensureCsrfToken();
-    auto &server = *manager_.server;
+    auto &server = *activeServer();
 
     std::vector<const char *> expected;
     expected.reserve(requiredFields.size() + 1);
@@ -2579,12 +2932,12 @@ std::vector<String> WiFiPortalService::collectChangedConfigFields(const AppConfi
 
 void WiFiPortalService::handleLogsJson()
 {
-    if (!manager_.server)
+    if (!activeServer())
         return;
 
     uint32_t afterId = 0;
-    if (manager_.server->hasArg("after"))
-        afterId = static_cast<uint32_t>(strtoul(manager_.server->arg("after").c_str(), nullptr, 10));
+    if (activeServer()->hasArg("after"))
+        afterId = static_cast<uint32_t>(strtoul(activeServer()->arg("after").c_str(), nullptr, 10));
 
     std::vector<DebugLogEntry> entries;
     log_.copyEntries(entries);
@@ -2607,12 +2960,12 @@ void WiFiPortalService::handleLogsJson()
 
     String body;
     serializeJson(doc, body);
-    manager_.server->send(200, "application/json", body);
+    activeServer()->send(200, "application/json", body);
 }
 
 void WiFiPortalService::sendTemplateError(const char *path)
 {
-    if (!manager_.server)
+    if (!activeServer())
     {
         log_.print(F("Cannot send template error for "));
         log_.print(path);
@@ -2620,7 +2973,7 @@ void WiFiPortalService::sendTemplateError(const char *path)
         return;
     }
     String body = String(F("Template not found: ")) + path;
-    manager_.server->send(500, "text/plain", body);
+    activeServer()->send(500, "text/plain", body);
     log_.print(F("Sent template error response for "));
     log_.println(path);
 }

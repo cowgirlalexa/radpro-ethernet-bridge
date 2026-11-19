@@ -14,7 +14,12 @@
         el.textContent = unit ? `${val} ${unit}`.trim() : val
     }
 
+    const REFRESH_MS = 10000
+    const RETRY_MS = 2000
+    const FETCH_TIMEOUT_MS = 3000
     let lastMeasurementSeconds = null
+    let refreshHandle = null
+    let isFetching = false
 
     const updateMeasurementAgeDisplay = () => {
         if (!hasDeviceInfo()) return
@@ -31,10 +36,21 @@
         }
     }
 
+    const scheduleRefresh = (delay) => {
+        if (document.hidden || !hasDeviceInfo()) return
+        if (refreshHandle) clearTimeout(refreshHandle)
+        refreshHandle = setTimeout(refreshDeviceInfo, delay)
+    }
+
     async function refreshDeviceInfo() {
-        if (!hasDeviceInfo()) return
+        if (!hasDeviceInfo() || document.hidden || isFetching) return
+        isFetching = true
+        refreshHandle = null
+        const controller = new AbortController()
+        const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
+        let nextDelay = REFRESH_MS
         try {
-            const resp = await fetch('/device.json', { cache: 'no-store' })
+            const resp = await fetch('/device.json', { cache: 'no-store', signal: controller.signal })
             if (!resp.ok) throw new Error('bad status')
             const data = await resp.json()
             setField('manufacturer', data.manufacturer)
@@ -61,14 +77,26 @@
             }
             updateMeasurementAgeDisplay()
         } catch (err) {
+            nextDelay = RETRY_MS
             console.warn('Device info refresh failed', err)
+        } finally {
+            clearTimeout(timeout)
+            isFetching = false
+            scheduleRefresh(nextDelay)
         }
     }
 
     document.addEventListener('portal-locale-ready', updateMeasurementAgeDisplay)
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            if (refreshHandle) clearTimeout(refreshHandle)
+            refreshHandle = null
+        } else if (hasDeviceInfo()) {
+            refreshDeviceInfo()
+        }
+    })
     document.addEventListener('DOMContentLoaded', () => {
         if (!hasDeviceInfo()) return
         refreshDeviceInfo()
-        setInterval(refreshDeviceInfo, 10000)
     })
 })()

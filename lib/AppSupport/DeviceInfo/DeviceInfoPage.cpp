@@ -30,3 +30,27 @@ void DeviceInfoPage::handleJson(WiFiManager *manager)
         return;
     manager->server->send(200, "application/json", store_.toJson());
 }
+
+void DeviceInfoPage::handlePage(WebServer *server)
+{
+    if (!server)
+        return;
+
+    File file = LittleFS.open("/portal/device-info.html", "r");
+    if (!file)
+    {
+        server->send(500, "text/plain", "Device info page missing.");
+        return;
+    }
+
+    String html = file.readString();
+    file.close();
+    server->send(200, "text/html", html);
+}
+
+void DeviceInfoPage::handleJson(WebServer *server)
+{
+    if (!server)
+        return;
+    server->send(200, "application/json", store_.toJson());
+}

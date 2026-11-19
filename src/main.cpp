@@ -44,6 +44,7 @@
 #include "Publishing/PublisherHealth.h"
 #include "Runtime/CooperativePump.h"
 #include "Network/BridgeDnsResolver.h"
+#include "NetworkStatus.h"
 #include "UsbRecoveryPolicy.h"
 #include "RadProUpdate/RadProUpdateService.h"
 
@@ -54,10 +55,6 @@
 // =========================
 // Board / LED definitions
 // =========================
-#ifndef RGB_BUILTIN
-#define RGB_BUILTIN 48 // ESP32-S3 DevKitC-1 onboard WS2812 pin
-#endif
-
 // Prefer the CP210x/UART "second USB port" for debug when USB-CDC is on
 #if defined(ARDUINO_USB_CDC_ON_BOOT) && (ARDUINO_USB_CDC_ON_BOOT == 1)
 #define DBG_SERIAL Serial0
@@ -343,8 +340,8 @@ void setup()
     safecastPublisher.begin();
     portalService.setOtaStartCallback([&]()
                                       { OtaUpdateService::EnterUpdateMode(device_manager, usb, mqttPublisher, openSenseMapPublisher, gmcMapPublisher, radmonPublisher, safecastPublisher, updateInProgress); });
-    timeSync.loop(WiFi.status() == WL_CONNECTED);
-    peripheralStarter.startIfNeeded(WiFi.status() == WL_CONNECTED, timeSync.synced(), kSupportedUsbVidPid);
+    timeSync.loop(portalService.networkConnected());
+    peripheralStarter.startIfNeeded(portalService.networkConnected(), timeSync.synced(), kSupportedUsbVidPid);
     mqttPublisher.setPublishCallback([&](bool success)
                                      {
         if (success)
@@ -358,15 +355,12 @@ void setup()
             mqttError = false;
         } });
 
-    WiFi.mode(WIFI_STA);
-    WiFi.setHostname(appConfig.deviceName.c_str());
-
     if (!portalService.connect(false))
     {
         DBG.println("Auto-connect or portal timed out; starting configuration portal.");
         portalService.connect(true);
     }
-    timeSync.loop(WiFi.status() == WL_CONNECTED);
+    timeSync.loop(portalService.networkConnected());
     mqttPublisher.updateConfig();
     openSenseMapPublisher.updateConfig();
     gmcMapPublisher.updateConfig();
@@ -389,11 +383,11 @@ void loop()
 {
     radProUpdater.poll();
     bool detectorUpdating = radProUpdater.ownsUsb();
-    const bool wifiConnected = WiFi.status() == WL_CONNECTED;
+    const bool networkConnected = portalService.networkConnected();
     if (updateInProgress || detectorUpdating)
         usbRecoveryWatchdog.reset();
-    timeSync.loop(wifiConnected);
-    peripheralStarter.startIfNeeded(wifiConnected, timeSync.synced(), kSupportedUsbVidPid);
+    timeSync.loop(networkConnected);
+    peripheralStarter.startIfNeeded(networkConnected, timeSync.synced(), kSupportedUsbVidPid);
 
     static bool wasDetectorUpdating = false;
     if (detectorUpdating && !wasDetectorUpdating)
@@ -468,7 +462,7 @@ void loop()
 
         if (!updateInProgress && !detectorUpdating &&
             peripheralStarter.started() &&
-            wifiConnected &&
+            portalService.networkConnected() &&
             UsbRecoveryPolicy::shouldRestart(now,
                                              usbDisconnectedSinceMs,
                                              lastUsbRestartAttemptMs,

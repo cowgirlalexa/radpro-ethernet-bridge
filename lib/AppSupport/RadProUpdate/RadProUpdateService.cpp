@@ -85,17 +85,17 @@ bool RadProUpdateService::validateImage(String &error)
     if (!file || file.size() != image_->size) { error = "Firmware upload is incomplete."; return false; }
     mbedtls_sha256_context context;
     mbedtls_sha256_init(&context);
-    mbedtls_sha256_starts_ret(&context, 0);
+    mbedtls_sha256_starts(&context, 0);
     uint8_t buffer[1024], digest[32];
     size_t count = 0;
     while (count < image_->size)
     {
         const size_t n = file.read(buffer, std::min(sizeof(buffer), image_->size - count));
         if (!n) break;
-        mbedtls_sha256_update_ret(&context, buffer, n);
+        mbedtls_sha256_update(&context, buffer, n);
         count += n;
     }
-    mbedtls_sha256_finish_ret(&context, digest);
+    mbedtls_sha256_finish(&context, digest);
     mbedtls_sha256_free(&context);
     char hex[65];
     for (size_t i = 0; i < 32; ++i) snprintf(hex + i * 2, 3, "%02x", digest[i]);

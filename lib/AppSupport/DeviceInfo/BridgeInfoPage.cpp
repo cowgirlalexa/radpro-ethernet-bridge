@@ -114,7 +114,6 @@ String BridgeInfoPage::collectJson() const
 #else
     doc["macAddress"] = WiFi.macAddress();
 #endif
-#endif
 
     JsonObject publishers = doc["publishers"].to<JsonObject>();
     auto appendHealth = [&publishers](const char *key, const PublisherHealthSnapshot &snapshot) {
